@@ -8,7 +8,7 @@ set -e
 #running as root gives the wrong homedir, check and exit if run with sudo.
 if ((EUID == 0)); then
     echo "The script is not designed to run as root user. Please run it without sudo prefix."
-    exit
+    exit 1
 fi
 
 #helper function to create avalanchego.service file
@@ -33,7 +33,7 @@ create_service_file () {
 create_config_file () {
   rm -f node.json
   echo "{" >>node.json
-  if [ "$rpcOpt" = "any" ]; then
+  if [ "$rpcOpt" = "public" ]; then
     echo "  \"http-host\": \"\",">>node.json
   fi
   if [ "$adminOpt" = "true" ]; then
@@ -132,16 +132,22 @@ check_reqs_rhel () {
   fi
 }
 getOsType () {
+foundOS="$(uname)"                              #get OS
+if [ "$foundOS" = "Linux" ]; then
   which yum 1>/dev/null 2>&1 && { echo "RHEL"; return; }
   which zypper 1>/dev/null 2>&1 && { echo "openSUSE"; return; }
   which apt-get 1>/dev/null 2>&1 && { echo "Debian"; return; }
+else
+  echo "$foundOS";
+  return;
+fi
 }
 
 
 #helper function that prints usage
 usage () {
   echo "Usage: $0 [--list | --help | --reinstall | --remove] [--version <tag>] [--ip dynamic|static|<IP>]"
-  echo "                     [--RPC local|all] [--archival] [--state-sync on|off] [--index] [--db-dir <path>]"
+  echo "                     [--rpc private|public] [--archival] [--state-sync on|off] [--index] [--db-dir <path>]"
   echo "Options:"
   echo "   --help            Shows this message"
   echo "   --list            Lists 10 newest versions available to install"
@@ -150,7 +156,7 @@ usage () {
   echo ""
   echo "   --version <tag>          Installs <tag> version, default is the latest"
   echo "   --ip dynamic|static|<IP> Uses dynamic, static (autodetect) or provided public IP, will ask if not provided"
-  echo "   --rpc local|any          Open RPC port (9650) to local or all network interfaces, will ask if not provided"
+  echo "   --rpc private|public     Open RPC port (9650) to private or public network interfaces, will ask if not provided"
   echo "   --archival               If provided, will disable state pruning, defaults to pruning enabled"
   echo "   --state-sync on|off      If provided explicitly turns C-Chain state sync on or off"
   echo "   --index                  If provided, will enable indexer and Index API, defaults to disabled"
@@ -241,19 +247,12 @@ elif [ "$osType" = "RHEL" ]; then
   check_reqs_rhel
 else
   #sorry, don't know you.
-  echo "Unsupported linux flavour/distribution: $osType"
+  echo "Unsupported OS or linux distribution found: $osType"
   echo "Exiting."
-  exit
+  exit 1
 fi
 foundIP="$(dig +short myip.opendns.com @resolver1.opendns.com)"
 foundArch="$(uname -m)"                         #get system architecture
-foundOS="$(uname)"                              #get OS
-if [ "$foundOS" != "Linux" ]; then
-  #sorry, don't know you.
-  echo "Unsupported operating system: $foundOS!"
-  echo "Exiting."
-  exit
-fi
 if [ "$foundArch" = "aarch64" ]; then
   getArch="arm64"                               #we're running on arm arch (probably RasPi)
   echo "Found arm64 architecture..."
@@ -264,7 +263,7 @@ else
   #sorry, don't know you.
   echo "Unsupported architecture: $foundArch!"
   echo "Exiting."
-  exit
+  exit 1
 fi
 if test -f "/etc/systemd/system/avalanchego.service"; then
   foundAvalancheGo=true
@@ -288,22 +287,69 @@ else
 fi
 if [[ `wget -S --spider $fileName  2>&1 | grep 'HTTP/1.1 200 OK'` ]]; then
   echo "Node version found."
+  echo "Attempting to download: $fileName"
+  wget -nv --show-progress $fileName
+
+  echo "Unpacking node files..."
+  mkdir -p $HOME/avalanche-node
+  tar xvf avalanchego-linux*.tar.gz -C $HOME/avalanche-node --strip-components=1;
+  mkdir -p $HOME/.avalanchego/plugins
+  rm avalanchego-linux-*.tar.gz
+  echo "Node files unpacked into $HOME/avalanche-node"
 else
-  echo "Unable to find AvalancheGo version $version. Exiting."
-  if [ "$foundAvalancheGo" = "true" ]; then
-    echo "Restarting service..."
-    sudo systemctl start avalanchego
+  shouldBuild=true
+  if ! command -v git >/dev/null 2>&1 ; then
+    echo "Missing git, will not attempt to build $version from source."
+    shouldBuild=false
   fi
-  exit
+  if ! command -v go >/dev/null 2>&1 ; then
+    echo "Missing go, will not attempt to build $version from source."
+    shouldBuild=false
+  fi
+  if ! command -v gcc >/dev/null 2>&1 ; then
+    echo "Missing gcc, will not attempt to build $version from source."
+    shouldBuild=false
+  fi
+  if [ "$shouldBuild" = "false" ]; then
+    echo "One or more building tools are missing. Exiting."
+    if [ "$foundAvalancheGo" = "true" ]; then
+      echo "Restarting service..."
+      sudo systemctl start avalanchego
+    fi
+    exit 1
+  fi
+
+  echo "Unable to find AvalancheGo release $version. Attempting to build $version from source."
+  mkdir -p avalanchego
+  cd avalanchego
+  git init
+  git remote add origin https://github.com/ava-labs/avalanchego
+  git fetch --depth 1 origin $version || {
+    echo "Unable to find AvalancheGo commit $version. Exiting."
+    if [ "$foundAvalancheGo" = "true" ]; then
+      echo "Restarting service..."
+      sudo systemctl start avalanchego
+    fi
+    exit 1
+  }
+  git checkout $version
+  ./scripts/build.sh || {
+    echo "Unable to build AvalancheGo commit $version. Exiting."
+    if [ "$foundAvalancheGo" = "true" ]; then
+      echo "Restarting service..."
+      sudo systemctl start avalanchego
+    fi
+    exit 1
+  }
+
+  echo "Moving node binary..."
+  mkdir -p $HOME/avalanche-node
+  cp -r ./build/* $HOME/avalanche-node
+  mkdir -p $HOME/.avalanchego/plugins
+  cd ..
+  rm -rf avalanchego
+  echo "Node binary move to $HOME/avalanche-node"
 fi
-echo "Attempting to download: $fileName"
-wget -nv --show-progress $fileName
-echo "Unpacking node files..."
-mkdir -p $HOME/avalanche-node
-tar xvf avalanchego-linux*.tar.gz -C $HOME/avalanche-node --strip-components=1;
-mkdir -p $HOME/.avalanchego/plugins
-rm avalanchego-linux-*.tar.gz
-echo "Node files unpacked into $HOME/avalanche-node"
 echo
 # on RHEL based systems, selinux prevents systemd running execs from home-dir, lets change this
 if [ "$osType" = "RHEL" ]; then
@@ -317,7 +363,7 @@ if [ "$foundAvalancheGo" = "true" ]; then
   echo "New node version:"
   $HOME/avalanche-node/avalanchego --version
   echo "Done!"
-  exit
+  exit 0
 fi
 if [ "$ipOpt" = "ask" ]; then
   echo "To complete the setup, some networking information is needed."
@@ -365,18 +411,40 @@ else
   foundIP="$ipOpt"
   ipChoice="2"
 fi
-echo ""
-echo "Your node can accept RPC calls on port 9650. If restricted to local, it will be accessible only from this machine."
-while [ "$rpcOpt" != "any" ] && [ "$rpcOpt" != "local" ]
-do
-  read -p "Do you want the RPC port to be accessible to any or only local network interface? [any, local]: " rpcOpt
-done
-if [ "$rpcOpt" = "any" ]; then
-  echo "RPC port will be accessible on any interface. Make sure you configure the firewall to only let through RPC requests"
-  echo "from known IP addresses, otherwise your node might be overwhelmed by RPC calls from malicious actors!"
+if [ "$rpcOpt" = "ask" ]; then
+  echo ""
+  echo "Your node accepts RPC calls on port 9650. If restricted to private, it will be accessible only from this machine."
+  echo "Only p2p port (9651 by default) NEEDS to be publicly accessible for correct node operation, RPC port is used for"
+  echo "interaction with the node by the operator or applications and SHOULD NOT be freely accessible to the public."
+  echo ""
+  echo "Note: Validator nodes SHOULD NOT have their RPC port open!"
+  echo ""
+  while [ "$rpcOpt" != "public" ] && [ "$rpcOpt" != "private" ]
+  do
+    read -p "RPC port should be public (this is a public API node) or private (this is a validator)? [public, private]: " rpcOpt
+  done
+  if [ "$rpcOpt" = "public" ]; then
+    echo ""
+    echo "If firewall or other form of access control is not provided, your node will be open to denial of service attacks."
+    echo "Node API server is not designed to defend against it! Make sure you configure the firewall to only let through"
+    echo "RPC requests from known IP addresses!"
+    echo ""
+    confirm="ask"
+    while [ "$confirm" != "yes" ] && [ "$confirm" != "no" ]
+    do
+      read -p "Are you sure you want to allow public access to the RPC port? [yes, no]: " confirm
+    done
+    if [ "$confirm" != "yes" ]; then
+      rpcOpt="private"
+    fi
+  fi
 fi
-if [ "$rpcOpt" = "local" ]; then
+echo ""
+if [ "$rpcOpt" = "private" ]; then
   echo "RPC port will be accessible only on local interface. RPC calls from remote machines will be blocked."
+fi
+if [ "$rpcOpt" = "public" ]; then
+  echo "WARNING: RPC port will be accessible publicly! You must set up access controls!"
 fi
 echo ""
 if [ "$indexOpt" = "true" ]; then
@@ -431,7 +499,7 @@ echo
 echo "Your node should now be bootstrapping."
 echo "Node configuration file is $HOME/.avalanchego/configs/node.json"
 echo "C-Chain configuration file is $HOME/.avalanchego/configs/chains/C/config.json"
-echo "Plugin directory, for storing subnet VM binaries, is $HOME/.avalanchego/plugins"
+echo "Plugin directory, for storing L1 VM binaries, is $HOME/.avalanchego/plugins"
 echo "To check that the service is running use the following command (q to exit):"
 echo "sudo systemctl status avalanchego"
 echo "To follow the log use (ctrl-c to stop):"
